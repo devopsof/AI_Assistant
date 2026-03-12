@@ -1,0 +1,17 @@
+.env
+*.env
+backend/.env
+
+__pycache__/
+*.pyc
+*.pyo
+
+backend/venv/
+.venv/
+
+frontend/node_modules/
+frontend/build/
+
+backend/data/**
+!backend/data/
+!backend/data/.gitkeep
