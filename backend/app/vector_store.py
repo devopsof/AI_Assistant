@@ -115,8 +115,8 @@ def get_chunk_neighbors(workspace_id: str, document_id: str, chunk_index: int) -
     documents = result.get("documents", [])
     mapping = dict(zip(ids, documents))
     return {
-        "previous_chunk_text": mapping.get(previous_id),
-        "next_chunk_text": mapping.get(next_id),
+        "previous_chunk_text": mapping.get(previous_id) or "",
+        "next_chunk_text": mapping.get(next_id) or "",
     }
 
 

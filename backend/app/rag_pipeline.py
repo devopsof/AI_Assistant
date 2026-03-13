@@ -1,5 +1,5 @@
 from time import perf_counter
-from typing import Dict, List
+from typing import Dict, Generator, List
 
 from openai import OpenAI
 
@@ -72,12 +72,48 @@ def build_prompt(
     )
 
 
+def _build_messages(prompt: str) -> List[Dict]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a grounded question-answering assistant. "
+                "Answer only from the supplied context."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+
+def _retrieve(
+    workspace_id: str,
+    question: str,
+    document_ids: List[str] | None,
+) -> tuple[Dict, List[Dict], Dict, str, float]:
+    """Run hybrid retrieval and synthesis. Returns (retrieval, chunks, synthesis, prompt, latency_ms)."""
+    settings = get_settings()
+    started_at = perf_counter()
+    retrieval = hybrid_search(
+        workspace_id,
+        question,
+        vector_top_k=max(settings.top_k_results * 4, 15),
+        final_k=settings.top_k_results,
+        document_ids=document_ids,
+    )
+    latency_ms = round((perf_counter() - started_at) * 1000, 2)
+    retrieved_chunks = retrieval["results"]
+    synthesis = build_synthesized_context(workspace_id, retrieved_chunks)
+    prompt = build_prompt(question, retrieved_chunks, [], synthesis["context"])
+    return retrieval, retrieved_chunks, synthesis, prompt, latency_ms
+
+
 def run_rag_pipeline(
     workspace_id: str,
     question: str,
     conversation_messages: List[Dict],
     document_ids: List[str] | None = None,
 ) -> Dict:
+    """Non-streaming pipeline. Returns a fully assembled result dict."""
     settings = get_settings()
     retrieval_started_at = perf_counter()
     retrieval = hybrid_search(
@@ -101,11 +137,9 @@ def run_rag_pipeline(
         keyword_query=retrieval["keyword_query"],
         intent=retrieval["intent"],
         retrieved_chunk_count=len(retrieved_chunks),
-        retrieved_chunks=retrieved_chunks,
         documents_used=synthesis["documents_used"],
         themes_detected=[theme["theme"] for theme in synthesis["themes"]],
         synthesis_time_ms=synthesis["synthesis_time_ms"],
-        final_context=prompt,
         vector_retrieval_ms=retrieval["vector_latency_ms"],
         keyword_retrieval_ms=retrieval["keyword_latency_ms"],
         retrieval_latency_ms=retrieval_latency_ms,
@@ -118,16 +152,7 @@ def run_rag_pipeline(
         client = _get_client()
         response = client.chat.completions.create(
             model=settings.groq_chat_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a grounded question-answering assistant. "
-                        "Answer only from the supplied context."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
+            messages=_build_messages(prompt),
         )
         answer = response.choices[0].message.content or "I do not know."
     except Exception as exc:
@@ -163,4 +188,117 @@ def run_rag_pipeline(
         "themes": [theme["theme"] for theme in synthesis["themes"]],
         "documents_used": synthesis["documents_used"],
         "synthesis_time_ms": synthesis["synthesis_time_ms"],
+    }
+
+
+def stream_rag_pipeline(
+    workspace_id: str,
+    question: str,
+    conversation_messages: List[Dict],
+    document_ids: List[str] | None = None,
+) -> Generator[Dict, None, None]:
+    """
+    Streaming pipeline. Yields dicts of two shapes:
+
+      {"type": "meta",  ...retrieval metadata...}
+      {"type": "chunk", "content": "<token text>"}
+      {"type": "done",  "answer": "<full answer>"}
+      {"type": "error", "message": "<error text>"}   (on LLM failure, falls back to full answer)
+    """
+    settings = get_settings()
+
+    # --- retrieval (blocking, happens before first token) ---
+    retrieval_started_at = perf_counter()
+    retrieval = hybrid_search(
+        workspace_id,
+        question,
+        vector_top_k=max(settings.top_k_results * 4, 15),
+        final_k=settings.top_k_results,
+        document_ids=document_ids,
+    )
+    retrieval_latency_ms = round((perf_counter() - retrieval_started_at) * 1000, 2)
+    retrieved_chunks = retrieval["results"]
+    synthesis = build_synthesized_context(workspace_id, retrieved_chunks)
+    prompt = build_prompt(question, retrieved_chunks, conversation_messages, synthesis["context"])
+
+    log_event(
+        logger,
+        "retrieval_completed",
+        workspace_id=workspace_id,
+        query=question,
+        normalized_query=retrieval["normalized_query"],
+        keyword_query=retrieval["keyword_query"],
+        intent=retrieval["intent"],
+        retrieved_chunk_count=len(retrieved_chunks),
+        documents_used=synthesis["documents_used"],
+        themes_detected=[theme["theme"] for theme in synthesis["themes"]],
+        synthesis_time_ms=synthesis["synthesis_time_ms"],
+        vector_retrieval_ms=retrieval["vector_latency_ms"],
+        keyword_retrieval_ms=retrieval["keyword_latency_ms"],
+        retrieval_latency_ms=retrieval_latency_ms,
+    )
+
+    # emit retrieval metadata so the client can render sources immediately
+    yield {
+        "type": "meta",
+        "retrieved_chunks": retrieved_chunks,
+        "retrieval_latency_ms": retrieval_latency_ms,
+        "vector_retrieval_ms": retrieval["vector_latency_ms"],
+        "keyword_retrieval_ms": retrieval["keyword_latency_ms"],
+        "document_set_hash": retrieval["document_set_hash"],
+        "candidate_document_ids": retrieval["candidate_document_ids"],
+        "relevant_collection_ids": retrieval.get("relevant_collection_ids", []),
+        "normalized_query": retrieval["normalized_query"],
+        "keyword_query": retrieval["keyword_query"],
+        "intent": retrieval["intent"],
+        "insights": synthesis["insights"],
+        "themes": [theme["theme"] for theme in synthesis["themes"]],
+        "documents_used": synthesis["documents_used"],
+        "synthesis_time_ms": synthesis["synthesis_time_ms"],
+    }
+
+    # --- streaming LLM call ---
+    llm_started_at = perf_counter()
+    accumulated = []
+    fallback_reason = ""
+
+    try:
+        client = _get_client()
+        stream = client.chat.completions.create(
+            model=settings.groq_chat_model,
+            messages=_build_messages(prompt),
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                accumulated.append(delta)
+                yield {"type": "chunk", "content": delta}
+
+    except Exception as exc:
+        fallback_reason = str(exc)
+        fallback = _fallback_answer(question, synthesis, retrieved_chunks)
+        accumulated = [fallback]
+        yield {"type": "error", "message": fallback_reason}
+        yield {"type": "chunk", "content": fallback}
+
+    llm_latency_ms = round((perf_counter() - llm_started_at) * 1000, 2)
+    full_answer = "".join(accumulated).strip() or "I do not know."
+
+    log_event(
+        logger,
+        "response_generated",
+        workspace_id=workspace_id,
+        query=question,
+        llm_latency_ms=llm_latency_ms,
+        retrieved_chunk_count=len(retrieved_chunks),
+        used_fallback=bool(fallback_reason),
+        fallback_reason=fallback_reason,
+        streamed=True,
+    )
+
+    yield {
+        "type": "done",
+        "answer": full_answer,
+        "llm_latency_ms": llm_latency_ms,
     }

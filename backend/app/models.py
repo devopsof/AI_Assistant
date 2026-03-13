@@ -58,10 +58,28 @@ class WorkspaceOverviewResponse(BaseModel):
     recent_documents: List[dict]
 
 
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+    name: str | None = None
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user_id: str
+
+
 class QueryRequest(BaseModel):
     question: str
     conversation_id: Optional[str] = None
     session_id: Optional[str] = None
+    use_global_knowledge: bool = False
+
+
+class UrlIngestRequest(BaseModel):
+    url: str
+    conversation_id: Optional[str] = None
+    collection_id: Optional[str] = None
 
 
 class SourceMetadata(BaseModel):
@@ -96,7 +114,9 @@ class UploadResponse(BaseModel):
     storage_location: str
     upload_timestamp: str
     chunks_stored: int
+    conversation_id: str = ""
     duplicate: bool = False
+    job_id: str = ""
 
 
 class DocumentSummary(BaseModel):

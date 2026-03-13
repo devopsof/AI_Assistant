@@ -1,14 +1,23 @@
 from datetime import datetime, timezone
 from hashlib import sha256
+from html import unescape
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 from collections import Counter
+from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import httpx
+from bs4 import BeautifulSoup
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
+from app.auth import get_current_user, login_user, signup_user
 from app.collection_manager import create_collection, delete_collection, find_collection, list_collections
 from app.config import get_settings
 from app.document_graph_builder import build_document_graph
@@ -30,9 +39,13 @@ from app.document_registry import (
 )
 from app.embeddings import generate_embedding, is_model_loaded
 from app.hybrid_retrieval import hybrid_search
+from app.keyword_index import clear_keyword_index_cache
 from app.knowledge_graph_builder import build_knowledge_graph
 from app.logging_utils import get_logger, log_event
+from app.job_store import create_job, get_job, update_job
 from app.models import (
+    AuthRequest,
+    AuthResponse,
     CollectionCreateRequest,
     CollectionDeleteResponse,
     CollectionListResponse,
@@ -51,12 +64,14 @@ from app.models import (
     ReindexResponse,
     SearchResponse,
     UploadResponse,
+    UrlIngestRequest,
     WorkspaceOverviewResponse,
     WorkspaceCreateRequest,
     WorkspaceDeleteResponse,
     WorkspaceListResponse,
     WorkspaceSummary,
 )
+from app.query_cache import clear_cached_results
 from app.query_service import answer_question, format_search_results, stream_answer_events
 from app.storage import (
     check_storage_connection,
@@ -71,10 +86,13 @@ from app.workspace_manager import create_workspace, delete_workspace, find_works
 app = FastAPI(title="AI Knowledge Assistant")
 settings = get_settings()
 logger = get_logger("api")
+limiter = Limiter(key_func=get_remote_address, enabled=settings.rate_limit_enabled)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -88,16 +106,18 @@ def _workspace_or_404(workspace_id: str) -> dict:
     return workspace
 
 
+def _clean_web_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        tag.decompose()
+    return unescape(soup.get_text(separator="\n", strip=True))
+
+
 @app.on_event("startup")
 def startup_event() -> None:
     storage_mode = get_storage_mode()
     storage_ready = check_storage_connection()
-    model_ready = False
-
-    try:
-        model_ready = is_model_loaded()
-    except Exception as exc:
-        log_event(logger, "model_startup_warning", error=str(exc))
+    model_ready = is_model_loaded()
 
     log_event(
         logger,
@@ -111,6 +131,10 @@ def startup_event() -> None:
         storage_ready=storage_ready,
         model_ready=model_ready,
     )
+    if not storage_ready:
+        raise RuntimeError("Storage backend is not ready.")
+    if not model_ready:
+        raise RuntimeError("Embedding model failed to load.")
 
 
 def _index_document(
@@ -176,9 +200,137 @@ def _index_document(
     return stored_count
 
 
+def _ingest_document_bytes(
+    workspace_id: str,
+    *,
+    document_id: str,
+    original_name: str,
+    file_bytes: bytes,
+    conversation_id: str | None,
+    collection_id: str | None,
+    user_id: str,
+    job_id: str,
+) -> UploadResponse:
+    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
+    if len(file_bytes) > max_upload_bytes:
+        raise HTTPException(status_code=400, detail=f"File exceeds {settings.max_upload_mb}MB limit.")
+
+    upload_started_at = perf_counter()
+    resolved_conversation_id = (
+        ensure_conversation(workspace_id, conversation_id) if conversation_id else None
+    )
+    resolved_collection = find_collection(workspace_id, collection_id)
+    update_job(job_id, "uploading", 10, "Uploading document...")
+
+    file_hash = sha256(file_bytes).hexdigest()
+    duplicate = find_duplicate_document(workspace_id, file_hash)
+    if duplicate:
+        attach_document_to_conversation(
+            workspace_id,
+            duplicate["document_id"],
+            resolved_conversation_id,
+        )
+        update_job(job_id, "done", 100, "Duplicate detected. Existing document linked.")
+        return UploadResponse(
+            message="duplicate document detected, ingestion skipped",
+            document_id=duplicate["document_id"],
+            document_name=duplicate["file_name"],
+            storage_location=duplicate.get("storage_location", ""),
+            upload_timestamp=duplicate["upload_timestamp"],
+            chunks_stored=duplicate.get("chunk_count", 0),
+            conversation_id=resolved_conversation_id or "",
+            duplicate=True,
+            job_id=job_id,
+        )
+
+    storage_location = ""
+    try:
+        storage_location = upload_document_bytes(workspace_id, document_id, original_name, file_bytes)
+        record = create_document_record(
+            workspace_id,
+            document_id,
+            original_name,
+            storage_location,
+            file_hash=file_hash,
+            file_size=len(file_bytes),
+            conversation_id=resolved_conversation_id,
+            collection_id=resolved_collection["collection_id"] if resolved_collection else None,
+        )
+
+        update_job(job_id, "indexing", 55, "Indexing document... generating embeddings.")
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir) / original_name
+            temp_path.write_bytes(file_bytes)
+            stored_count = _index_document(
+                workspace_id=workspace_id,
+                document_id=document_id,
+                original_name=original_name,
+                upload_timestamp=record["upload_timestamp"],
+                temp_path=temp_path,
+            )
+
+        log_event(
+            logger,
+            "document_uploaded",
+            user_id=user_id,
+            workspace_id=workspace_id,
+            document_id=document_id,
+            document_name=original_name,
+            storage_mode=get_storage_mode(),
+            storage_location=storage_location,
+            upload_timestamp=record["upload_timestamp"],
+            upload_latency_ms=round((perf_counter() - upload_started_at) * 1000, 2),
+        )
+        clear_keyword_index_cache()
+        clear_cached_results()
+        update_job(job_id, "done", 100, f"Done! {stored_count} chunks indexed.")
+        return UploadResponse(
+            message="document processed successfully",
+            document_id=document_id,
+            document_name=original_name,
+            storage_location=record["storage_location"],
+            upload_timestamp=record["upload_timestamp"],
+            chunks_stored=stored_count,
+            conversation_id=resolved_conversation_id or "",
+            job_id=job_id,
+        )
+    except HTTPException:
+        remove_document_record(workspace_id, document_id)
+        if storage_location:
+            try:
+                delete_document_object(storage_location)
+            except Exception:
+                pass
+        update_job(job_id, "error", 100, "Document ingestion failed.")
+        raise
+    except Exception as exc:
+        remove_document_record(workspace_id, document_id)
+        if storage_location:
+            try:
+                delete_document_object(storage_location)
+            except Exception:
+                pass
+        update_job(job_id, "error", 100, str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/")
 def root() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/auth/signup", response_model=AuthResponse)
+def signup(payload: AuthRequest) -> AuthResponse:
+    if not payload.email.strip() or not payload.password.strip():
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    return AuthResponse(**signup_user(payload.email, payload.password))
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def login(payload: AuthRequest) -> AuthResponse:
+    if not payload.email.strip() or not payload.password.strip():
+        raise HTTPException(status_code=400, detail="Email and password are required.")
+    return AuthResponse(**login_user(payload.email, payload.password))
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -201,8 +353,16 @@ def healthcheck() -> HealthResponse:
     )
 
 
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str) -> dict:
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return job
+
+
 @app.get("/workspaces", response_model=WorkspaceListResponse)
-def get_workspaces() -> WorkspaceListResponse:
+def get_workspaces(user_id: str = Depends(get_current_user)) -> WorkspaceListResponse:
     return WorkspaceListResponse(
         workspaces=[
             WorkspaceSummary(**workspace)
@@ -215,7 +375,10 @@ def get_workspaces() -> WorkspaceListResponse:
 
 
 @app.get("/workspaces/{workspace_id}/collections", response_model=CollectionListResponse)
-def get_collections(workspace_id: str) -> CollectionListResponse:
+def get_collections(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+) -> CollectionListResponse:
     _workspace_or_404(workspace_id)
     return CollectionListResponse(
         collections=[CollectionSummary(**collection) for collection in list_collections(workspace_id)]
@@ -226,6 +389,7 @@ def get_collections(workspace_id: str) -> CollectionListResponse:
 def create_collection_endpoint(
     workspace_id: str,
     payload: CollectionCreateRequest,
+    user_id: str = Depends(get_current_user),
 ) -> CollectionSummary:
     _workspace_or_404(workspace_id)
     if not payload.collection_name.strip():
@@ -234,7 +398,11 @@ def create_collection_endpoint(
 
 
 @app.delete("/workspaces/{workspace_id}/collections/{collection_id}", response_model=CollectionDeleteResponse)
-def delete_collection_endpoint(workspace_id: str, collection_id: str) -> CollectionDeleteResponse:
+def delete_collection_endpoint(
+    workspace_id: str,
+    collection_id: str,
+    user_id: str = Depends(get_current_user),
+) -> CollectionDeleteResponse:
     _workspace_or_404(workspace_id)
     collection = find_collection(workspace_id, collection_id)
     if not collection:
@@ -256,6 +424,7 @@ def delete_collection_endpoint(workspace_id: str, collection_id: str) -> Collect
 
     if not delete_collection(workspace_id, collection_id):
         raise HTTPException(status_code=400, detail="Collection could not be deleted.")
+    clear_cached_results()
 
     return CollectionDeleteResponse(
         message="collection deleted successfully",
@@ -265,7 +434,10 @@ def delete_collection_endpoint(workspace_id: str, collection_id: str) -> Collect
 
 
 @app.post("/workspaces", response_model=WorkspaceSummary)
-def create_workspace_endpoint(payload: WorkspaceCreateRequest) -> WorkspaceSummary:
+def create_workspace_endpoint(
+    payload: WorkspaceCreateRequest,
+    user_id: str = Depends(get_current_user),
+) -> WorkspaceSummary:
     workspace_name = payload.workspace_name.strip()
     if not workspace_name:
         raise HTTPException(status_code=400, detail="Workspace name cannot be empty.")
@@ -273,6 +445,7 @@ def create_workspace_endpoint(payload: WorkspaceCreateRequest) -> WorkspaceSumma
     log_event(
         logger,
         "workspace_created",
+        user_id=user_id,
         workspace_id=workspace["workspace_id"],
         workspace_name=workspace["workspace_name"],
     )
@@ -280,7 +453,10 @@ def create_workspace_endpoint(payload: WorkspaceCreateRequest) -> WorkspaceSumma
 
 
 @app.get("/workspaces/{workspace_id}/overview", response_model=WorkspaceOverviewResponse)
-def workspace_overview(workspace_id: str) -> WorkspaceOverviewResponse:
+def workspace_overview(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+) -> WorkspaceOverviewResponse:
     workspace = _workspace_or_404(workspace_id)
     documents = list_document_records(workspace_id)
     topics = Counter(
@@ -319,13 +495,19 @@ def workspace_overview(workspace_id: str) -> WorkspaceOverviewResponse:
 
 
 @app.delete("/workspaces/{workspace_id}", response_model=WorkspaceDeleteResponse)
-def delete_workspace_endpoint(workspace_id: str) -> WorkspaceDeleteResponse:
+def delete_workspace_endpoint(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+) -> WorkspaceDeleteResponse:
     workspace = _workspace_or_404(workspace_id)
     delete_workspace_index(workspace_id)
     delete_workspace(workspace_id)
+    clear_keyword_index_cache()
+    clear_cached_results()
     log_event(
         logger,
         "workspace_deleted",
+        user_id=user_id,
         workspace_id=workspace_id,
         workspace_name=workspace["workspace_name"],
     )
@@ -336,7 +518,10 @@ def delete_workspace_endpoint(workspace_id: str) -> WorkspaceDeleteResponse:
 
 
 @app.get("/workspaces/{workspace_id}/documents", response_model=DocumentListResponse)
-def list_documents(workspace_id: str) -> DocumentListResponse:
+def list_documents(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+) -> DocumentListResponse:
     _workspace_or_404(workspace_id)
     documents = [
         DocumentSummary(
@@ -365,11 +550,15 @@ def list_documents(workspace_id: str) -> DocumentListResponse:
 
 
 @app.post("/workspaces/{workspace_id}/upload", response_model=UploadResponse)
+@limiter.limit("10/minute")
 async def upload_document(
+    request: Request,
+    background_tasks: BackgroundTasks,
     workspace_id: str,
     file: UploadFile = File(...),
     conversation_id: str | None = Form(None),
     collection_id: str | None = Form(None),
+    user_id: str = Depends(get_current_user),
 ) -> UploadResponse:
     _workspace_or_404(workspace_id)
     suffix = Path(file.filename or "").suffix.lower()
@@ -381,108 +570,131 @@ async def upload_document(
         )
 
     original_name = Path(file.filename or "").name
+    file_bytes = await file.read()
+    max_upload_bytes = settings.max_upload_mb * 1024 * 1024
+    if len(file_bytes) > max_upload_bytes:
+        raise HTTPException(status_code=400, detail=f"File exceeds {settings.max_upload_mb}MB limit.")
+    job_id = uuid4().hex
     document_id = generate_document_id()
     resolved_conversation_id = (
         ensure_conversation(workspace_id, conversation_id) if conversation_id else None
     )
-    resolved_collection = find_collection(workspace_id, collection_id)
-
-    try:
-        upload_started_at = perf_counter()
-        file_bytes = await file.read()
-        file_hash = sha256(file_bytes).hexdigest()
-        duplicate = find_duplicate_document(workspace_id, file_hash)
-        if duplicate:
-            attach_document_to_conversation(
-                workspace_id,
-                duplicate["document_id"],
-                resolved_conversation_id,
-            )
-            return UploadResponse(
-                message="duplicate document detected, ingestion skipped",
-                document_id=duplicate["document_id"],
-                document_name=duplicate["file_name"],
-                storage_location=duplicate.get("storage_location", ""),
-                upload_timestamp=duplicate["upload_timestamp"],
-                chunks_stored=duplicate.get("chunk_count", 0),
-                duplicate=True,
-            )
-
-        storage_location = upload_document_bytes(workspace_id, document_id, original_name, file_bytes)
-        record = create_document_record(
-            workspace_id,
-            document_id,
-            original_name,
-            storage_location,
-            file_hash=file_hash,
-            file_size=len(file_bytes),
-            conversation_id=resolved_conversation_id,
-            collection_id=resolved_collection["collection_id"] if resolved_collection else None,
-        )
-
-        with TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir) / original_name
-            temp_path.write_bytes(file_bytes)
-            stored_count = _index_document(
-                workspace_id=workspace_id,
-                document_id=document_id,
-                original_name=original_name,
-                upload_timestamp=record["upload_timestamp"],
-                temp_path=temp_path,
-            )
-
-        log_event(
-            logger,
-            "document_uploaded",
-            workspace_id=workspace_id,
-            document_id=document_id,
-            document_name=original_name,
-            storage_mode=get_storage_mode(),
-            storage_location=storage_location,
-            upload_timestamp=record["upload_timestamp"],
-            upload_latency_ms=round((perf_counter() - upload_started_at) * 1000, 2),
-        )
-    except HTTPException:
-        remove_document_record(workspace_id, document_id)
-        try:
-            if "storage_location" in locals():
-                delete_document_object(storage_location)
-        except Exception:
-            pass
-        raise
-    except Exception as exc:
-        remove_document_record(workspace_id, document_id)
-        try:
-            if "storage_location" in locals():
-                delete_document_object(storage_location)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
+    create_job(job_id)
+    background_tasks.add_task(
+        _ingest_document_bytes,
+        workspace_id,
+        document_id=document_id,
+        original_name=original_name,
+        file_bytes=file_bytes,
+        conversation_id=conversation_id,
+        collection_id=collection_id,
+        user_id=user_id,
+        job_id=job_id,
+    )
     return UploadResponse(
-        message="document processed successfully",
+        message="document upload accepted",
         document_id=document_id,
         document_name=original_name,
-        storage_location=record["storage_location"],
-        upload_timestamp=record["upload_timestamp"],
-        chunks_stored=stored_count,
+        storage_location="",
+        upload_timestamp=datetime.now(timezone.utc).isoformat(),
+        chunks_stored=0,
+        conversation_id=resolved_conversation_id or "",
+        job_id=job_id,
     )
 
 
 @app.post("/workspaces/{workspace_id}/query", response_model=QueryResponse)
-def query_documents(workspace_id: str, payload: QueryRequest) -> QueryResponse:
+@limiter.limit("30/minute")
+def query_documents(
+    request: Request,
+    workspace_id: str,
+    payload: QueryRequest,
+    user_id: str = Depends(get_current_user),
+) -> QueryResponse:
     _workspace_or_404(workspace_id)
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     try:
-        return answer_question(workspace_id, payload.question, payload.conversation_id, payload.session_id)
+        return answer_question(
+            workspace_id,
+            payload.question,
+            payload.conversation_id,
+            payload.session_id,
+            payload.use_global_knowledge,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/workspaces/{workspace_id}/ingest-url", response_model=UploadResponse)
+@limiter.limit("10/minute")
+async def ingest_url(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    workspace_id: str,
+    payload: UrlIngestRequest,
+    user_id: str = Depends(get_current_user),
+) -> UploadResponse:
+    _workspace_or_404(workspace_id)
+    if not payload.url.strip():
+        raise HTTPException(status_code=400, detail="URL is required.")
+
+    job_id = uuid4().hex
+    create_job(job_id)
+    update_job(job_id, "uploading", 15, "Fetching web page...")
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0) as client:
+            response = await client.get(payload.url.strip())
+            response.raise_for_status()
+        text = _clean_web_text(response.text)
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No readable text was found at the provided URL.")
+        page_title = BeautifulSoup(response.text, "html.parser").title
+        base_name = (page_title.get_text(strip=True) if page_title else payload.url.strip()).strip() or "web-page"
+        safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "-", base_name).strip(" .-") or "web-page"
+        file_name = f"{safe_name[:80]}.txt"
+        document_id = generate_document_id()
+        resolved_conversation_id = (
+            ensure_conversation(workspace_id, payload.conversation_id) if payload.conversation_id else None
+        )
+        background_tasks.add_task(
+            _ingest_document_bytes,
+            workspace_id,
+            document_id=document_id,
+            original_name=file_name,
+            file_bytes=text.encode("utf-8"),
+            conversation_id=payload.conversation_id,
+            collection_id=payload.collection_id,
+            user_id=user_id,
+            job_id=job_id,
+        )
+        return UploadResponse(
+            message="url ingestion accepted",
+            document_id=document_id,
+            document_name=file_name,
+            storage_location="",
+            upload_timestamp=datetime.now(timezone.utc).isoformat(),
+            chunks_stored=0,
+            conversation_id=resolved_conversation_id or "",
+            job_id=job_id,
+        )
+    except HTTPException:
+        update_job(job_id, "error", 100, "URL ingestion failed.")
+        raise
+    except httpx.HTTPError as exc:
+        update_job(job_id, "error", 100, "Could not fetch the URL.")
+        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {exc}") from exc
+
+
 @app.post("/workspaces/{workspace_id}/query/stream")
-def stream_query_documents(workspace_id: str, payload: QueryRequest) -> StreamingResponse:
+@limiter.limit("30/minute")
+def stream_query_documents(
+    request: Request,
+    workspace_id: str,
+    payload: QueryRequest,
+    user_id: str = Depends(get_current_user),
+) -> StreamingResponse:
     _workspace_or_404(workspace_id)
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
@@ -493,6 +705,7 @@ def stream_query_documents(workspace_id: str, payload: QueryRequest) -> Streamin
             payload.question,
             payload.conversation_id,
             payload.session_id,
+            payload.use_global_knowledge,
         ),
         media_type="text/event-stream",
         headers={
@@ -507,6 +720,7 @@ def search_documents(
     workspace_id: str,
     q: str,
     conversation_id: str | None = None,
+    user_id: str = Depends(get_current_user),
 ) -> SearchResponse:
     _workspace_or_404(workspace_id)
     if not q.strip():
@@ -529,6 +743,7 @@ def search_documents(
 def knowledge_graph(
     workspace_id: str,
     conversation_id: str | None = None,
+    user_id: str = Depends(get_current_user),
 ) -> KnowledgeGraphResponse:
     _workspace_or_404(workspace_id)
     try:
@@ -542,6 +757,7 @@ def knowledge_graph(
 def document_graph(
     workspace_id: str,
     docs: str = "",
+    user_id: str = Depends(get_current_user),
 ) -> KnowledgeGraphResponse:
     _workspace_or_404(workspace_id)
     document_ids = [
@@ -557,7 +773,11 @@ def document_graph(
 
 
 @app.delete("/workspaces/{workspace_id}/documents/{document_id}", response_model=DeleteDocumentResponse)
-def delete_document(workspace_id: str, document_id: str) -> DeleteDocumentResponse:
+def delete_document(
+    workspace_id: str,
+    document_id: str,
+    user_id: str = Depends(get_current_user),
+) -> DeleteDocumentResponse:
     _workspace_or_404(workspace_id)
     record = find_document_record(workspace_id, document_id)
     if not record:
@@ -568,10 +788,13 @@ def delete_document(workspace_id: str, document_id: str) -> DeleteDocumentRespon
     if storage_location:
         delete_document_object(storage_location)
     remove_document_record(workspace_id, document_id)
+    clear_keyword_index_cache()
+    clear_cached_results()
 
     log_event(
         logger,
         "document_deleted",
+        user_id=user_id,
         workspace_id=workspace_id,
         document_id=document_id,
         document_name=record["file_name"],
@@ -587,6 +810,7 @@ def move_document(
     workspace_id: str,
     document_id: str,
     payload: MoveDocumentRequest,
+    user_id: str = Depends(get_current_user),
 ) -> DocumentSummary:
     _workspace_or_404(workspace_id)
     record = find_document_record(workspace_id, document_id)
@@ -602,6 +826,7 @@ def move_document(
         collection_id=collection["collection_id"],
         collection_name=collection["collection_name"],
     )
+    clear_cached_results()
     return DocumentSummary(
         document_id=updated["document_id"],
         file_name=updated["file_name"],
@@ -621,7 +846,11 @@ def move_document(
 
 
 @app.get("/workspaces/{workspace_id}/documents/{document_id}/preview", response_model=DocumentPreviewResponse)
-def preview_document(workspace_id: str, document_id: str) -> DocumentPreviewResponse:
+def preview_document(
+    workspace_id: str,
+    document_id: str,
+    user_id: str = Depends(get_current_user),
+) -> DocumentPreviewResponse:
     _workspace_or_404(workspace_id)
     record = find_document_record(workspace_id, document_id)
     if not record:
@@ -638,7 +867,11 @@ def preview_document(workspace_id: str, document_id: str) -> DocumentPreviewResp
     "/workspaces/{workspace_id}/documents/{document_id}/summary",
     response_model=DocumentIntelligenceResponse,
 )
-def document_summary(workspace_id: str, document_id: str) -> DocumentIntelligenceResponse:
+def document_summary(
+    workspace_id: str,
+    document_id: str,
+    user_id: str = Depends(get_current_user),
+) -> DocumentIntelligenceResponse:
     _workspace_or_404(workspace_id)
     record = find_document_record(workspace_id, document_id)
     if not record:
@@ -655,7 +888,11 @@ def document_summary(workspace_id: str, document_id: str) -> DocumentIntelligenc
 
 
 @app.post("/workspaces/{workspace_id}/documents/reindex", response_model=ReindexResponse)
-def reindex_document(workspace_id: str, payload: ReindexRequest) -> ReindexResponse:
+def reindex_document(
+    workspace_id: str,
+    payload: ReindexRequest,
+    user_id: str = Depends(get_current_user),
+) -> ReindexResponse:
     _workspace_or_404(workspace_id)
     record = find_document_record(workspace_id, payload.document_id)
     if not record:
@@ -687,6 +924,8 @@ def reindex_document(workspace_id: str, payload: ReindexRequest) -> ReindexRespo
         )
     else:
         raise HTTPException(status_code=404, detail="No document storage location found.")
+    clear_keyword_index_cache()
+    clear_cached_results()
 
     return ReindexResponse(
         message="document reindexed successfully",

@@ -78,8 +78,11 @@ def find_workspace(workspace_id: str) -> Optional[Dict]:
 
 
 def delete_workspace(workspace_id: str) -> None:
+    from app.vector_store import delete_workspace_index
+
     workspaces = [workspace for workspace in _load_workspaces() if workspace["workspace_id"] != workspace_id]
     _save_workspaces(workspaces)
+    delete_workspace_index(workspace_id)
     root = get_workspace_paths(workspace_id)["root"]
     if root.exists():
         for attempt in range(3):

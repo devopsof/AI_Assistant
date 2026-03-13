@@ -105,6 +105,12 @@ function KnowledgeGraphPage({ workspaceId, documents, onSelectNode }) {
   const [layout, setLayout] = useState({ nodes: [], edges: [] });
 
   useEffect(() => {
+    if (window.innerWidth <= 768) {
+      setViewMode("list");
+    }
+  }, []);
+
+  useEffect(() => {
     const availableIds = new Set((documents || []).map((document) => document.document_id));
     setSelectedDocumentIds((current) => current.filter((documentId) => availableIds.has(documentId)));
   }, [documents]);

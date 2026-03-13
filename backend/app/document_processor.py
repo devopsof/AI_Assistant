@@ -1,4 +1,5 @@
 import re
+import email
 from pathlib import Path
 from typing import List
 
@@ -7,7 +8,7 @@ from pypdf import PdfReader
 
 from app.config import get_settings
 
-SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown"}
+SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".markdown", ".docx", ".epub", ".eml"}
 
 
 
@@ -19,6 +20,43 @@ def extract_text(file_path: Path) -> str:
 
     if suffix in {".txt", ".md", ".markdown"}:
         return file_path.read_text(encoding="utf-8", errors="ignore")
+
+    if suffix == ".docx":
+        from docx import Document as DocxDocument
+
+        doc = DocxDocument(str(file_path))
+        return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+
+    if suffix == ".epub":
+        import ebooklib
+        from ebooklib import epub
+        from bs4 import BeautifulSoup
+
+        book = epub.read_epub(str(file_path))
+        texts = []
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_content(), "html.parser")
+            texts.append(soup.get_text(separator=" ", strip=True))
+        return "\n".join(text for text in texts if text.strip())
+
+    if suffix == ".eml":
+        from email import policy
+
+        msg = email.message_from_bytes(file_path.read_bytes(), policy=policy.default)
+        parts = [
+            f"From: {msg['from']}",
+            f"To: {msg['to']}",
+            f"Subject: {msg['subject']}",
+            f"Date: {msg['date']}",
+            "---",
+        ]
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    parts.append(part.get_content())
+        else:
+            parts.append(msg.get_content())
+        return "\n".join(str(part) for part in parts if part)
 
     raise ValueError(f"Unsupported file type: {suffix}")
 
