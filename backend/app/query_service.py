@@ -204,6 +204,7 @@ def answer_question(
     question: str,
     conversation_id: str | None = None,
     session_id: str | None = None,
+    use_global_knowledge: bool = False,  # ← FIXED: was missing, causing TypeError
 ) -> QueryResponse:
     started_at = perf_counter()
     resolved_session_id, resolved_conversation_id = _resolve_session_and_conversation(
@@ -362,6 +363,7 @@ def stream_answer_events(
     question: str,
     conversation_id: str | None = None,
     session_id: str | None = None,
+    use_global_knowledge: bool = False,  # ← FIXED: was missing, causing TypeError
 ):
     """
     Real SSE generator backed by the LLM's streaming API.
