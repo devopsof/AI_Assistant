@@ -32,6 +32,8 @@ export function useWorkspace() {
     var workspaceOverview = _useState5[0];
     var setWorkspaceOverview = _useState5[1];
 
+    // Start as true — assume backend is up until proven otherwise.
+    // A 401 is NOT a network failure; it means the backend is reachable.
     var _useState6 = useState(true);
     var isBackendReachable = _useState6[0];
     var setIsBackendReachable = _useState6[1];
@@ -56,6 +58,7 @@ export function useWorkspace() {
         try {
             var data = await fetchWorkspaces();
             var list = data.workspaces || [];
+            // If we got a response, backend is definitely reachable
             setIsBackendReachable(true);
             setWorkspaces(list);
             var matchesCurrent = list.some(function(w) { return w.workspace_id === activeWorkspaceId; });
@@ -64,10 +67,32 @@ export function useWorkspace() {
             setStatus("");
             return list;
         } catch (err) {
+            var message = err.message || "";
+
+            // 401 / 403 = backend is reachable, user just isn't authenticated yet.
+            // This happens on initial load before the auth token is stored.
+            // Do NOT mark backend as unreachable in this case.
+            var isAuthError = (
+                message.includes("401") ||
+                message.includes("403") ||
+                message.toLowerCase().includes("unauthorized") ||
+                message.toLowerCase().includes("authentication") ||
+                message.toLowerCase().includes("forbidden")
+            );
+
+            if (isAuthError) {
+                // Backend is up — silently ignore, auth will handle redirect
+                setIsBackendReachable(true);
+                setWorkspaces([]);
+                setActiveWorkspaceId("");
+                return [];
+            }
+
+            // True network failure (TypeError = fetch failed, CORS, server down, etc.)
             setIsBackendReachable(false);
             setWorkspaces([]);
             setActiveWorkspaceId("");
-            setStatus(err.message);
+            setStatus(message);
             return [];
         }
     }, [activeWorkspaceId, setActiveWorkspaceId]);
@@ -81,6 +106,7 @@ export function useWorkspace() {
                 return list.some(function(c) { return c.collection_id === prev; }) ? prev : "";
             });
         } catch (err) {
+            // Don't crash the app if collections fail to load
             setStatus(err.message);
         }
     }, []);
