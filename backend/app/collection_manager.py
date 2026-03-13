@@ -1,51 +1,88 @@
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
+from app.config import get_settings
+from app.database_sqlite import get_db_connection, with_lock
 from app.workspace_manager import ensure_workspace_dirs
 
 DEFAULT_COLLECTION_NAME = "General"
 
 
-def _collections_path(workspace_id: str):
-    return ensure_workspace_dirs(workspace_id)["collections_index"]
-
-
-def _load_collections(workspace_id: str) -> List[Dict]:
+def _migrate_from_json() -> None:
     try:
-        return json.loads(_collections_path(workspace_id).read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
+        settings = get_settings()
+        root = settings.workspaces_root
+        conn = get_db_connection()
+        with with_lock():
+            count = conn.execute("SELECT COUNT(1) FROM collections").fetchone()[0]
+            if count:
+                return
+            for path in root.glob("*/collections.json"):
+                try:
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                for item in records:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO collections (collection_id, workspace_id, collection_name, created_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            item.get("collection_id"),
+                            item.get("workspace_id"),
+                            item.get("collection_name"),
+                            item.get("created_at"),
+                        ),
+                    )
+                path.rename(path.with_name(path.name + ".migrated"))
+            conn.commit()
+    except Exception:
+        return
 
 
-def _save_collections(workspace_id: str, collections: List[Dict]) -> None:
-    _collections_path(workspace_id).write_text(
-        json.dumps(collections, indent=2),
-        encoding="utf-8",
-    )
+_migrate_from_json()
 
 
 def ensure_default_collection(workspace_id: str) -> Dict:
-    collections = _load_collections(workspace_id)
-    existing = next((item for item in collections if item["collection_name"] == DEFAULT_COLLECTION_NAME), None)
-    if existing:
-        return existing
-
-    collection = {
-        "collection_id": f"collection_{uuid4().hex[:8]}",
-        "workspace_id": workspace_id,
-        "collection_name": DEFAULT_COLLECTION_NAME,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    collections.append(collection)
-    _save_collections(workspace_id, collections)
+    conn = get_db_connection()
+    with with_lock():
+        row = conn.execute(
+            "SELECT collection_id, workspace_id, collection_name, created_at "
+            "FROM collections WHERE workspace_id = ? AND collection_name = ?",
+            (workspace_id, DEFAULT_COLLECTION_NAME),
+        ).fetchone()
+        if row:
+            return dict(row)
+        collection = {
+            "collection_id": f"collection_{uuid4().hex[:8]}",
+            "workspace_id": workspace_id,
+            "collection_name": DEFAULT_COLLECTION_NAME,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        conn.execute(
+            "INSERT INTO collections (collection_id, workspace_id, collection_name, created_at) VALUES (?, ?, ?, ?)",
+            (
+                collection["collection_id"],
+                collection["workspace_id"],
+                collection["collection_name"],
+                collection["created_at"],
+            ),
+        )
+        conn.commit()
+    ensure_workspace_dirs(workspace_id)
     return collection
 
 
 def list_collections(workspace_id: str) -> List[Dict]:
     ensure_default_collection(workspace_id)
-    return _load_collections(workspace_id)
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT collection_id, workspace_id, collection_name, created_at FROM collections WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def create_collection(workspace_id: str, collection_name: str) -> Dict:
@@ -64,18 +101,30 @@ def create_collection(workspace_id: str, collection_name: str) -> Dict:
         "collection_name": collection_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    collections.append(collection)
-    _save_collections(workspace_id, collections)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute(
+            "INSERT INTO collections (collection_id, workspace_id, collection_name, created_at) VALUES (?, ?, ?, ?)",
+            (
+                collection["collection_id"],
+                collection["workspace_id"],
+                collection["collection_name"],
+                collection["created_at"],
+            ),
+        )
+        conn.commit()
     return collection
 
 
 def find_collection(workspace_id: str, collection_id: str | None) -> Optional[Dict]:
     if not collection_id:
         return ensure_default_collection(workspace_id)
-    return next(
-        (item for item in list_collections(workspace_id) if item["collection_id"] == collection_id),
-        None,
-    )
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT collection_id, workspace_id, collection_name, created_at FROM collections WHERE collection_id = ?",
+        (collection_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def get_collection_name(workspace_id: str, collection_id: str | None) -> str:
@@ -84,10 +133,11 @@ def get_collection_name(workspace_id: str, collection_id: str | None) -> str:
 
 
 def delete_collection(workspace_id: str, collection_id: str) -> bool:
-    collections = list_collections(workspace_id)
-    collection = next((item for item in collections if item["collection_id"] == collection_id), None)
+    collection = find_collection(workspace_id, collection_id)
     if not collection or collection["collection_name"] == DEFAULT_COLLECTION_NAME:
         return False
-    remaining = [item for item in collections if item["collection_id"] != collection_id]
-    _save_collections(workspace_id, remaining)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute("DELETE FROM collections WHERE collection_id = ?", (collection_id,))
+        conn.commit()
     return True

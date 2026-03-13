@@ -10,7 +10,8 @@ class Settings(BaseSettings):
         default="http://localhost:3000,http://127.0.0.1:3000",
         validation_alias=AliasChoices("ALLOWED_ORIGINS", "CORS_ORIGINS"),
     )
-    jwt_secret_key: str = Field(default="dev-jwt-secret-change-me", alias="JWT_SECRET_KEY")
+    jwt_secret_key: str = Field(default="CHANGE_ME_IN_PRODUCTION", alias="JWT_SECRET_KEY")
+    auth_enabled: bool = Field(default=True, alias="AUTH_ENABLED")
     storage_mode: str = Field(default="local", alias="STORAGE_MODE")
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
     groq_base_url: str = Field(default="https://api.groq.com/openai/v1", alias="GROQ_BASE_URL")
@@ -40,6 +41,8 @@ class Settings(BaseSettings):
     top_k_results: int = Field(default=5, alias="TOP_K")
     max_upload_mb: int = Field(default=20, alias="MAX_UPLOAD_MB")
     rate_limit_enabled: bool = Field(default=True, alias="RATE_LIMIT_ENABLED")
+    redis_url: str = Field(default="", alias="REDIS_URL")
+    app_env: str = Field(default="development", alias="APP_ENV")
 
     model_config = SettingsConfigDict(
         env_file=".env",

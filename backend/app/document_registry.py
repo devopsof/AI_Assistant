@@ -1,35 +1,92 @@
 import json
-from pathlib import Path
-from hashlib import sha256
 from datetime import datetime, timezone
+from hashlib import sha256
+from pathlib import Path
 from typing import Dict, List, Optional
 from uuid import uuid4
 
-from app.workspace_manager import ensure_workspace_dirs
+from app.config import get_settings
 from app.collection_manager import get_collection_name
+from app.database_sqlite import get_db_connection, j, js, with_lock
+from app.workspace_manager import ensure_workspace_dirs
 
 
-def _registry_path(workspace_id: str) -> Path:
-    return ensure_workspace_dirs(workspace_id)["documents_index"]
-
-
-def _load_registry(workspace_id: str) -> List[Dict]:
-    path = _registry_path(workspace_id)
+def _migrate_from_json() -> None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
+        settings = get_settings()
+        root = settings.workspaces_root
+        conn = get_db_connection()
+        with with_lock():
+            count = conn.execute("SELECT COUNT(1) FROM documents").fetchone()[0]
+            if count:
+                return
+            for path in root.glob("*/documents_index.json"):
+                try:
+                    records = json.loads(path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                for item in records:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO documents "
+                        "(document_id, workspace_id, file_name, document_name, storage_location, file_hash, "
+                        "file_size, collection_id, collection_name, upload_timestamp, chunk_count, indexed_at, "
+                        "summary, topics, entities, concepts, important_sections, conversation_ids) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            item.get("document_id"),
+                            item.get("workspace_id") or path.parent.name,
+                            item.get("file_name"),
+                            item.get("document_name"),
+                            item.get("storage_location"),
+                            item.get("file_hash"),
+                            item.get("file_size", 0),
+                            item.get("collection_id"),
+                            item.get("collection_name"),
+                            item.get("upload_timestamp"),
+                            item.get("chunk_count", 0),
+                            item.get("indexed_at"),
+                            item.get("summary", ""),
+                            js(item.get("topics", [])),
+                            js(item.get("entities", [])),
+                            js(item.get("concepts", [])),
+                            js(item.get("important_sections", [])),
+                            js(item.get("conversation_ids", [])),
+                        ),
+                    )
+                path.rename(path.with_name(path.name + ".migrated"))
+            conn.commit()
+    except Exception:
+        return
 
 
-def _save_registry(workspace_id: str, records: List[Dict]) -> None:
-    _registry_path(workspace_id).write_text(
-        json.dumps(records, indent=2),
-        encoding="utf-8",
-    )
+_migrate_from_json()
 
 
 def generate_document_id() -> str:
     return uuid4().hex
+
+
+def _row_to_record(row: Dict) -> Dict:
+    return {
+        "document_id": row["document_id"],
+        "workspace_id": row["workspace_id"],
+        "file_name": row["file_name"],
+        "document_name": row["document_name"],
+        "storage_location": row["storage_location"],
+        "file_hash": row["file_hash"],
+        "file_size": row["file_size"],
+        "collection_id": row["collection_id"],
+        "collection_name": row["collection_name"],
+        "upload_timestamp": row["upload_timestamp"],
+        "chunk_count": row["chunk_count"],
+        "indexed_at": row["indexed_at"],
+        "summary": row["summary"],
+        "topics": j(row["topics"]),
+        "entities": j(row["entities"]),
+        "concepts": j(row["concepts"]),
+        "important_sections": j(row["important_sections"]),
+        "conversation_ids": j(row["conversation_ids"]),
+    }
 
 
 def create_document_record(
@@ -42,9 +99,9 @@ def create_document_record(
     conversation_id: str | None = None,
     collection_id: str | None = None,
 ) -> Dict:
-    records = _load_registry(workspace_id)
     record = {
         "document_id": document_id,
+        "workspace_id": workspace_id,
         "file_name": file_name,
         "document_name": file_name,
         "storage_location": storage_location,
@@ -62,18 +119,57 @@ def create_document_record(
         "important_sections": [],
         "conversation_ids": [conversation_id] if conversation_id else [],
     }
-    records.append(record)
-    _save_registry(workspace_id, records)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute(
+            "INSERT INTO documents "
+            "(document_id, workspace_id, file_name, document_name, storage_location, file_hash, file_size, "
+            "collection_id, collection_name, upload_timestamp, chunk_count, indexed_at, summary, topics, "
+            "entities, concepts, important_sections, conversation_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                record["document_id"],
+                record["workspace_id"],
+                record["file_name"],
+                record["document_name"],
+                record["storage_location"],
+                record["file_hash"],
+                record["file_size"],
+                record["collection_id"],
+                record["collection_name"],
+                record["upload_timestamp"],
+                record["chunk_count"],
+                record["indexed_at"],
+                record["summary"],
+                js(record["topics"]),
+                js(record["entities"]),
+                js(record["concepts"]),
+                js(record["important_sections"]),
+                js(record["conversation_ids"]),
+            ),
+        )
+        conn.commit()
+    ensure_workspace_dirs(workspace_id)
     return record
 
 
 def remove_document_record(workspace_id: str, document_id: str) -> None:
-    records = [record for record in _load_registry(workspace_id) if record["document_id"] != document_id]
-    _save_registry(workspace_id, records)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute(
+            "DELETE FROM documents WHERE workspace_id = ? AND document_id = ?",
+            (workspace_id, document_id),
+        )
+        conn.commit()
 
 
 def list_document_records(workspace_id: str, conversation_id: str | None = None) -> List[Dict]:
-    records = _load_registry(workspace_id)
+    conn = get_db_connection()
+    rows = conn.execute(
+        "SELECT * FROM documents WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchall()
+    records = [_row_to_record(dict(row)) for row in rows]
     if not conversation_id:
         return records
     return [
@@ -84,23 +180,42 @@ def list_document_records(workspace_id: str, conversation_id: str | None = None)
 
 
 def find_document_record(workspace_id: str, document_id: str) -> Optional[Dict]:
-    return next((record for record in _load_registry(workspace_id) if record["document_id"] == document_id), None)
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT * FROM documents WHERE workspace_id = ? AND document_id = ?",
+        (workspace_id, document_id),
+    ).fetchone()
+    return _row_to_record(dict(row)) if row else None
 
 
 def find_duplicate_document(workspace_id: str, file_hash: str) -> Optional[Dict]:
-    return next((record for record in _load_registry(workspace_id) if record.get("file_hash") == file_hash), None)
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT * FROM documents WHERE workspace_id = ? AND file_hash = ?",
+        (workspace_id, file_hash),
+    ).fetchone()
+    return _row_to_record(dict(row)) if row else None
 
 
 def update_document_record(workspace_id: str, document_id: str, **updates: object) -> Optional[Dict]:
-    records = _load_registry(workspace_id)
-    updated_record: Optional[Dict] = None
-    for record in records:
-        if record["document_id"] == document_id:
-            record.update(updates)
-            updated_record = record
-            break
-    _save_registry(workspace_id, records)
-    return updated_record
+    if not updates:
+        return find_document_record(workspace_id, document_id)
+    fields = []
+    values = []
+    for key, value in updates.items():
+        if key in {"topics", "entities", "concepts", "important_sections", "conversation_ids"}:
+            value = js(value)
+        fields.append(f"{key} = ?")
+        values.append(value)
+    values.extend([workspace_id, document_id])
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute(
+            f"UPDATE documents SET {', '.join(fields)} WHERE workspace_id = ? AND document_id = ?",
+            tuple(values),
+        )
+        conn.commit()
+    return find_document_record(workspace_id, document_id)
 
 
 def attach_document_to_conversation(
@@ -133,9 +248,8 @@ def get_document_set_hash(
     records = sorted(
         [
             record
-            for record in _load_registry(workspace_id)
-            if (not conversation_id or conversation_id in record.get("conversation_ids", []))
-            and (not document_ids or record.get("document_id") in document_ids)
+            for record in list_document_records(workspace_id, conversation_id)
+            if (not document_ids or record.get("document_id") in document_ids)
         ],
         key=lambda item: item.get("document_id", ""),
     )

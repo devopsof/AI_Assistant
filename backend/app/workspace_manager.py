@@ -7,22 +7,40 @@ from typing import Dict, List, Optional
 from uuid import uuid4
 
 from app.config import get_settings
+from app.database_sqlite import get_db_connection, with_lock
 
 
-def _load_workspaces() -> List[Dict]:
-    settings = get_settings()
+def _migrate_from_json() -> None:
     try:
-        return json.loads(settings.workspaces_index_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
+        settings = get_settings()
+        json_path = settings.workspaces_index_path
+        if not json_path.exists():
+            return
+        conn = get_db_connection()
+        with with_lock():
+            count = conn.execute("SELECT COUNT(1) FROM workspaces").fetchone()[0]
+            if count:
+                return
+            try:
+                workspaces = json.loads(json_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return
+            for item in workspaces:
+                conn.execute(
+                    "INSERT OR IGNORE INTO workspaces (workspace_id, workspace_name, created_at) VALUES (?, ?, ?)",
+                    (
+                        item.get("workspace_id"),
+                        item.get("workspace_name"),
+                        item.get("created_at"),
+                    ),
+                )
+            conn.commit()
+            json_path.rename(json_path.with_name(json_path.name + ".migrated"))
+    except Exception:
+        return
 
 
-def _save_workspaces(workspaces: List[Dict]) -> None:
-    settings = get_settings()
-    settings.workspaces_index_path.write_text(
-        json.dumps(workspaces, indent=2),
-        encoding="utf-8",
-    )
+_migrate_from_json()
 
 
 def get_workspace_paths(workspace_id: str) -> Dict[str, Path]:
@@ -47,41 +65,52 @@ def ensure_workspace_dirs(workspace_id: str) -> Dict[str, Path]:
     paths = get_workspace_paths(workspace_id)
     for key in ("root", "documents", "vectordb", "conversations"):
         paths[key].mkdir(parents=True, exist_ok=True)
-    if not paths["documents_index"].exists():
-        paths["documents_index"].write_text("[]", encoding="utf-8")
-    if not paths["collections_index"].exists():
-        paths["collections_index"].write_text("[]", encoding="utf-8")
-    if not paths["sessions"].exists():
-        paths["sessions"].write_text("{}", encoding="utf-8")
     return paths
 
 
 def create_workspace(workspace_name: str) -> Dict:
-    workspaces = _load_workspaces()
     workspace = {
         "workspace_id": f"workspace_{uuid4().hex[:8]}",
         "workspace_name": workspace_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    workspaces.append(workspace)
-    _save_workspaces(workspaces)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute(
+            "INSERT INTO workspaces (workspace_id, workspace_name, created_at) VALUES (?, ?, ?)",
+            (workspace["workspace_id"], workspace["workspace_name"], workspace["created_at"]),
+        )
+        conn.commit()
     ensure_workspace_dirs(workspace["workspace_id"])
     return workspace
 
 
 def list_workspaces() -> List[Dict]:
-    return _load_workspaces()
+    conn = get_db_connection()
+    rows = conn.execute("SELECT workspace_id, workspace_name, created_at FROM workspaces").fetchall()
+    return [dict(row) for row in rows]
 
 
 def find_workspace(workspace_id: str) -> Optional[Dict]:
-    return next((workspace for workspace in _load_workspaces() if workspace["workspace_id"] == workspace_id), None)
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT workspace_id, workspace_name, created_at FROM workspaces WHERE workspace_id = ?",
+        (workspace_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def delete_workspace(workspace_id: str) -> None:
     from app.vector_store import delete_workspace_index
 
-    workspaces = [workspace for workspace in _load_workspaces() if workspace["workspace_id"] != workspace_id]
-    _save_workspaces(workspaces)
+    conn = get_db_connection()
+    with with_lock():
+        conn.execute("DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM collections WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM documents WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM conversations WHERE workspace_id = ?", (workspace_id,))
+        conn.execute("DELETE FROM sessions WHERE workspace_id = ?", (workspace_id,))
+        conn.commit()
     delete_workspace_index(workspace_id)
     root = get_workspace_paths(workspace_id)["root"]
     if root.exists():

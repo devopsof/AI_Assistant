@@ -103,6 +103,11 @@ function AppDashboard({ initialPanel = "chat" }) {
   }, [workspace.activeWorkspaceId]);
 
   useEffect(() => {
+    if (!conversations.activeConversationLocalId) return;
+    conversations.hydrateConversation(conversations.activeConversationLocalId);
+  }, [conversations.activeConversationLocalId, conversations.hydrateConversation]);
+
+  useEffect(() => {
     function handleClickOutside(event) {
       if (workspaceMenuRef.current && !workspaceMenuRef.current.contains(event.target)) {
         setShowWorkspaceMenu(false);

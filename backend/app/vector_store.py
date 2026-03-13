@@ -131,11 +131,3 @@ def delete_workspace_index(workspace_id: str) -> None:
         client.delete_collection(name=get_collection_name(workspace_id))
     except Exception:
         pass
-    finally:
-        server = getattr(client, "_server", None)
-        stop = getattr(server, "stop", None)
-        if callable(stop):
-            try:
-                stop()
-            except Exception:
-                pass

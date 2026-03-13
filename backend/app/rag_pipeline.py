@@ -1,6 +1,7 @@
 from time import perf_counter
 from typing import Dict, Generator, List
 
+import openai
 from openai import OpenAI
 
 from app.config import get_settings
@@ -10,12 +11,18 @@ from app.logging_utils import get_logger, log_event
 
 logger = get_logger("rag_pipeline")
 
+LLM_TIMEOUT_SECONDS = 30
+
 
 def _get_client() -> OpenAI:
     settings = get_settings()
     if not settings.groq_api_key or settings.groq_api_key.startswith("your_"):
         raise ValueError("GROQ_API_KEY is not configured.")
-    return OpenAI(api_key=settings.groq_api_key, base_url=settings.groq_base_url)
+    return OpenAI(
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        timeout=LLM_TIMEOUT_SECONDS,
+    )
 
 
 def _fallback_answer(question: str, synthesis: Dict, retrieved_chunks: List[Dict]) -> str:
@@ -155,6 +162,14 @@ def run_rag_pipeline(
             messages=_build_messages(prompt),
         )
         answer = response.choices[0].message.content or "I do not know."
+    except openai.APITimeoutError as exc:
+        logger.error("LLM call timed out after %ss: %s", LLM_TIMEOUT_SECONDS, exc)
+        fallback_reason = str(exc)
+        answer = _fallback_answer(question, synthesis, retrieved_chunks)
+    except openai.APIConnectionError as exc:
+        logger.error("LLM connection error: %s", exc)
+        fallback_reason = str(exc)
+        answer = _fallback_answer(question, synthesis, retrieved_chunks)
     except Exception as exc:
         fallback_reason = str(exc)
         answer = _fallback_answer(question, synthesis, retrieved_chunks)
@@ -274,7 +289,16 @@ def stream_rag_pipeline(
             if delta:
                 accumulated.append(delta)
                 yield {"type": "chunk", "content": delta}
-
+    except openai.APITimeoutError as exc:
+        logger.error("LLM call timed out after %ss: %s", LLM_TIMEOUT_SECONDS, exc)
+        yield {"type": "error", "message": "LLM request timed out"}
+        yield {"type": "done", "answer": "".join(accumulated).strip()}
+        return
+    except openai.APIConnectionError as exc:
+        logger.error("LLM connection error: %s", exc)
+        yield {"type": "error", "message": "LLM connection error"}
+        yield {"type": "done", "answer": "".join(accumulated).strip()}
+        return
     except Exception as exc:
         fallback_reason = str(exc)
         fallback = _fallback_answer(question, synthesis, retrieved_chunks)
@@ -302,3 +326,12 @@ def stream_rag_pipeline(
         "answer": full_answer,
         "llm_latency_ms": llm_latency_ms,
     }
+
+
+def is_model_loaded() -> bool:
+    try:
+        from app.embeddings import is_model_loaded as embeddings_ready
+
+        return embeddings_ready()
+    except Exception:
+        return False

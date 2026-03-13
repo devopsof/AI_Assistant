@@ -6,6 +6,8 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from collections import Counter
 from uuid import uuid4
+import re
+import time
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from limits.storage import RedisStorage
 
 from app.auth import get_current_user, login_user, signup_user
 from app.collection_manager import create_collection, delete_collection, find_collection, list_collections
@@ -24,7 +27,11 @@ from app.document_graph_builder import build_document_graph
 from app.document_intelligence import analyze_document_text
 from app.database import check_vector_db_connection
 from app.document_processor import SUPPORTED_EXTENSIONS, prepare_document
-from app.conversation_memory import ensure_conversation
+from app.conversation_memory import (
+    ensure_conversation,
+    get_conversation_messages,
+    list_conversations,
+)
 from app.document_registry import (
     attach_document_to_conversation,
     create_document_record,
@@ -86,9 +93,14 @@ from app.workspace_manager import create_workspace, delete_workspace, find_works
 app = FastAPI(title="AI Knowledge Assistant")
 settings = get_settings()
 logger = get_logger("api")
-limiter = Limiter(key_func=get_remote_address, enabled=settings.rate_limit_enabled)
+if settings.redis_url:
+    limiter = Limiter(key_func=get_remote_address, storage_uri=settings.redis_url)
+else:
+    limiter = Limiter(key_func=get_remote_address, enabled=settings.rate_limit_enabled)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+APP_START_TIME = time.time()
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,6 +130,20 @@ def startup_event() -> None:
     storage_mode = get_storage_mode()
     storage_ready = check_storage_connection()
     model_ready = is_model_loaded()
+    cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+
+    logger.info("CORS allowed origins: %s", cors_origins)
+    if settings.app_env != "development":
+        for origin in cors_origins:
+            if "localhost" in origin or "127.0.0.1" in origin:
+                if settings.app_env == "production":
+                    raise RuntimeError(
+                        "CORS is configured for localhost in production mode. "
+                        "Set ALLOWED_ORIGINS to your CloudFront or ALB domain."
+                    )
+                logger.warning(
+                    "CORS includes localhost origins — update ALLOWED_ORIGINS before production deployment"
+                )
 
     log_event(
         logger,
@@ -323,7 +349,9 @@ def root() -> dict:
 def signup(payload: AuthRequest) -> AuthResponse:
     if not payload.email.strip() or not payload.password.strip():
         raise HTTPException(status_code=400, detail="Email and password are required.")
-    return AuthResponse(**signup_user(payload.email, payload.password))
+    signup_user(payload.email, payload.password)
+    token_payload = login_user(payload.email, payload.password)
+    return AuthResponse(**token_payload)
 
 
 @app.post("/auth/login", response_model=AuthResponse)
@@ -350,7 +378,33 @@ def healthcheck() -> HealthResponse:
         vector_db="connected" if vector_db_connected else "disconnected",
         model_loaded=model_status,
         storage="connected" if storage_connected else "disconnected",
+        uptime_seconds=round(time.time() - APP_START_TIME, 1),
     )
+
+
+@app.get("/health/live")
+def health_live() -> dict:
+    return {"status": "alive"}
+
+
+@app.get("/health/ready")
+def health_ready():
+    issues = []
+    try:
+        if not is_model_loaded():
+            issues.append("embedding model not loaded")
+    except Exception as exc:
+        issues.append(f"model check error: {exc}")
+    try:
+        if not check_storage_connection():
+            issues.append("storage not reachable")
+    except Exception as exc:
+        issues.append(f"storage check error: {exc}")
+    if issues:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=503, content={"status": "not ready", "reason": ", ".join(issues)})
+    return {"status": "ready"}
 
 
 @app.get("/jobs/{job_id}")
@@ -547,6 +601,28 @@ def list_documents(
         )
     ]
     return DocumentListResponse(documents=documents)
+
+
+@app.get("/workspaces/{workspace_id}/conversations")
+def list_conversations_endpoint(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+) -> dict:
+    _workspace_or_404(workspace_id)
+    return {"conversations": list_conversations(workspace_id)}
+
+
+@app.get("/workspaces/{workspace_id}/conversations/{conversation_id}/messages")
+def get_conversation_messages_endpoint(
+    workspace_id: str,
+    conversation_id: str,
+    user_id: str = Depends(get_current_user),
+) -> dict:
+    _workspace_or_404(workspace_id)
+    return {
+        "conversation_id": conversation_id,
+        "messages": get_conversation_messages(workspace_id, conversation_id),
+    }
 
 
 @app.post("/workspaces/{workspace_id}/upload", response_model=UploadResponse)

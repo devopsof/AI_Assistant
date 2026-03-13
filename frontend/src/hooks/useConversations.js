@@ -1,238 +1,305 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { streamKnowledgeQuery } from "../services/api";
+
+import {
+  fetchConversations,
+  fetchConversationMessages,
+  streamKnowledgeQuery,
+} from "../services/api";
 
 const STORAGE_PREFIX = "knowledge_assistant_conversations:";
 
 function createLocalConversation() {
-    return {
-        localId: "chat_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
-        title: "New chat",
-        updatedAt: new Date().toISOString(),
-        sessionId: "",
-        messages: [],
-    };
+  return {
+    localId: `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    conversationId: "",
+    title: "New chat",
+    updatedAt: new Date().toISOString(),
+    sessionId: "",
+    messages: [],
+  };
 }
 
 function readPersistedState(workspaceId) {
-    if (!workspaceId) return { conversations: [], activeId: "" };
-    try {
-        var raw = window.localStorage.getItem(STORAGE_PREFIX + workspaceId);
-        if (!raw) return { conversations: [], activeId: "" };
-        var parsed = JSON.parse(raw);
-        if (!parsed.conversations || !parsed.conversations.length) return { conversations: [], activeId: "" };
-        return {
-            conversations: parsed.conversations,
-            activeId: parsed.activeId || parsed.conversations[0].localId,
-        };
-    } catch (_) {
-        return { conversations: [], activeId: "" };
-    }
+  if (!workspaceId) return { conversations: [], activeId: "" };
+  try {
+    const raw = window.localStorage.getItem(`${STORAGE_PREFIX}${workspaceId}`);
+    if (!raw) return { conversations: [], activeId: "" };
+    const parsed = JSON.parse(raw);
+    if (!parsed.conversations || !parsed.conversations.length) return { conversations: [], activeId: "" };
+    return {
+      conversations: parsed.conversations,
+      activeId: parsed.activeId || parsed.conversations[0].localId,
+    };
+  } catch (_error) {
+    return { conversations: [], activeId: "" };
+  }
 }
 
-function truncate(value, length) {
-    var len = length || 34;
-    if (!value) return "";
-    return value.length > len ? value.slice(0, len) + "..." : value;
+function deriveTitle(messages) {
+  const firstUser = messages.find((message) => message.role === "user");
+  if (!firstUser) return "New chat";
+  return firstUser.content.length > 32 ? `${firstUser.content.slice(0, 32)}...` : firstUser.content;
 }
 
 export function useConversations(activeWorkspaceId, onComposerStatus) {
-    var _useState = useState([]);
-    var conversations = _useState[0];
-    var setConversations = _useState[1];
+  const [conversations, setConversations] = useState([]);
+  const [activeConversationLocalId, setActiveConversationLocalId] = useState("");
+  const [isThinking, setIsThinking] = useState(false);
+  const [loadingStage, setLoadingStage] = useState("");
+  const pendingLoadRef = useRef(false);
 
-    var _useState2 = useState("");
-    var activeConversationLocalId = _useState2[0];
-    var setActiveConversationLocalId = _useState2[1];
+  const activeConversation =
+    conversations.find((conv) => conv.localId === activeConversationLocalId) ||
+    conversations[0] ||
+    null;
 
-    var _useState3 = useState(false);
-    var isThinking = _useState3[0];
-    var setIsThinking = _useState3[1];
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      setConversations([]);
+      setActiveConversationLocalId("");
+      return;
+    }
+    const saved = readPersistedState(activeWorkspaceId);
+    setConversations(saved.conversations);
+    setActiveConversationLocalId(saved.activeId);
+  }, [activeWorkspaceId]);
 
-    var _useState4 = useState("Assistant is thinking...");
-    var loadingStage = _useState4[0];
-    var setLoadingStage = _useState4[1];
-
-    var stageTimerRef = useRef(null);
-
-    var activeConversation =
-        conversations.find(function(c) { return c.localId === activeConversationLocalId; }) ||
-        conversations[0] ||
-        null;
-
-    useEffect(function() {
-        if (!activeWorkspaceId) {
-            setConversations([]);
-            setActiveConversationLocalId("");
-            return;
-        }
-        var saved = readPersistedState(activeWorkspaceId);
-        setConversations(saved.conversations);
-        setActiveConversationLocalId(saved.activeId);
-    }, [activeWorkspaceId]);
-
-    useEffect(function() {
-        if (!activeWorkspaceId) return;
-        window.localStorage.setItem(
-            STORAGE_PREFIX + activeWorkspaceId,
-            JSON.stringify({ activeId: activeConversationLocalId, conversations: conversations })
-        );
-    }, [activeConversationLocalId, activeWorkspaceId, conversations]);
-
-    var updateConversation = useCallback(function(localId, updater) {
-        setConversations(function(prev) {
-            return prev.map(function(c) { return c.localId === localId ? updater(c) : c; });
-        });
-    }, []);
-
-    var createNewChat = useCallback(function() {
-        if (!activeWorkspaceId) return null;
-        var conversation = createLocalConversation();
-        setConversations(function(prev) { return [conversation].concat(prev); });
-        setActiveConversationLocalId(conversation.localId);
-        return conversation;
-    }, [activeWorkspaceId]);
-
-    var clearWorkspaceConversations = useCallback(function(workspaceId) {
-        window.localStorage.removeItem(STORAGE_PREFIX + workspaceId);
-    }, []);
-
-    var submitQuestion = useCallback(
-        async function(content, workspaceId, setSelectedSource) {
-            if (!content.trim() || !workspaceId || isThinking) return;
-
-            var localConversationId = activeConversation ? activeConversation.localId : null;
-            if (!localConversationId) {
-                if (onComposerStatus) onComposerStatus("Start a new chat in this workspace first");
-                return;
-            }
-
-            var assistantMessageId = "assistant_" + Date.now();
-            if (onComposerStatus) onComposerStatus("");
-
-            updateConversation(localConversationId, function(conv) {
-                return Object.assign({}, conv, {
-                    title: conv.messages.length === 0 ? truncate(content, 32) : conv.title,
-                    updatedAt: new Date().toISOString(),
-                    messages: conv.messages.concat([
-                        { id: "user_" + Date.now(), role: "user", content: content },
-                        {
-                            id: assistantMessageId,
-                            role: "assistant",
-                            content: "",
-                            sources: [],
-                            suggestions: [],
-                            confidence: null,
-                            rewrittenQuery: "",
-                            debug: null,
-                            insights: [],
-                            themes: [],
-                            isStreaming: true,
-                        },
-                    ]),
-                });
-            });
-
-            setIsThinking(true);
-            setLoadingStage("Assistant is thinking...");
-            if (stageTimerRef.current) window.clearInterval(stageTimerRef.current);
-            stageTimerRef.current = window.setInterval(function() {
-                setLoadingStage(function(prev) {
-                    return prev === "Assistant is thinking..." ? "Searching documents..." : "Assistant is thinking...";
-                });
-            }, 1100);
-
-            try {
-                await streamKnowledgeQuery(workspaceId, content, activeConversation.localId, {
-                    onMeta: function(meta) {
-                        if (meta.session_id) {
-                            window.sessionStorage.setItem("session_id:" + workspaceId, meta.session_id);
-                        }
-                        updateConversation(localConversationId, function(conv) {
-                            return Object.assign({}, conv, {
-                                sessionId: meta.session_id || conv.sessionId,
-                                updatedAt: new Date().toISOString(),
-                                messages: conv.messages.map(function(msg) {
-                                    if (msg.id !== assistantMessageId) return msg;
-                                    return Object.assign({}, msg, {
-                                        sources: (meta.sources || []).map(function(s) {
-                                            return Object.assign({}, s, { workspace_id: workspaceId });
-                                        }),
-                                        insights: meta.insights || [],
-                                        themes: meta.themes || [],
-                                    });
-                                }),
-                            });
-                        });
-                    },
-
-                    onChunk: function(chunk) {
-                        var delta = chunk.delta || "";
-                        updateConversation(localConversationId, function(conv) {
-                            return Object.assign({}, conv, {
-                                messages: conv.messages.map(function(msg) {
-                                    if (msg.id !== assistantMessageId) return msg;
-                                    return Object.assign({}, msg, { content: (msg.content || "") + delta });
-                                }),
-                            });
-                        });
-                    },
-
-                    onDone: function(response) {
-                        if (response.session_id) {
-                            window.sessionStorage.setItem("session_id:" + workspaceId, response.session_id);
-                        }
-                        updateConversation(localConversationId, function(conv) {
-                            return Object.assign({}, conv, {
-                                sessionId: response.session_id,
-                                updatedAt: new Date().toISOString(),
-                                messages: conv.messages.map(function(msg) {
-                                    if (msg.id !== assistantMessageId) return msg;
-                                    return Object.assign({}, msg, {
-                                        content: response.answer,
-                                        sources: (response.sources || []).map(function(s) {
-                                            return Object.assign({}, s, { workspace_id: workspaceId });
-                                        }),
-                                        suggestions: response.suggestions || [],
-                                        confidence: response.confidence,
-                                        rewrittenQuery: response.rewritten_query,
-                                        debug: response.debug,
-                                        insights: response.insights || [],
-                                        themes: response.themes || [],
-                                        isStreaming: false,
-                                    });
-                                }),
-                            });
-                        });
-
-                        if (response.sources && response.sources.length && setSelectedSource) {
-                            setSelectedSource(Object.assign({}, response.sources[0], { workspace_id: workspaceId }));
-                        }
-                    },
-                });
-            } catch (err) {
-                updateConversation(localConversationId, function(conv) {
-                    return Object.assign({}, conv, {
-                        messages: conv.messages.filter(function(msg) { return msg.id !== assistantMessageId; }),
-                    });
-                });
-                if (onComposerStatus) onComposerStatus(err.message);
-            } finally {
-                if (stageTimerRef.current) window.clearInterval(stageTimerRef.current);
-                setIsThinking(false);
-                setLoadingStage("Assistant is thinking...");
-            }
-        }, [activeConversation, isThinking, onComposerStatus, updateConversation]
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    window.localStorage.setItem(
+      `${STORAGE_PREFIX}${activeWorkspaceId}`,
+      JSON.stringify({ activeId: activeConversationLocalId, conversations })
     );
+  }, [activeConversationLocalId, activeWorkspaceId, conversations]);
 
-    return {
-        conversations: conversations,
-        activeConversation: activeConversation,
-        activeConversationLocalId: activeConversationLocalId,
-        setActiveConversationLocalId: setActiveConversationLocalId,
-        isThinking: isThinking,
-        loadingStage: loadingStage,
-        createNewChat: createNewChat,
-        clearWorkspaceConversations: clearWorkspaceConversations,
-        submitQuestion: submitQuestion,
-    };
+  useEffect(() => {
+    if (!activeWorkspaceId || pendingLoadRef.current) return;
+    pendingLoadRef.current = true;
+    fetchConversations(activeWorkspaceId)
+      .then((data) => {
+        const backendConversations = data.conversations || [];
+        setConversations((current) => {
+          const byBackendId = new Map(
+            current
+              .filter((item) => item.conversationId)
+              .map((item) => [item.conversationId, item])
+          );
+          const merged = backendConversations.map((backend) => {
+            const existing = byBackendId.get(backend.conversation_id);
+            if (existing) {
+              return {
+                ...existing,
+                sessionId: backend.session_id || existing.sessionId,
+                updatedAt: backend.updated_at || existing.updatedAt,
+              };
+            }
+            return {
+              localId: `chat_${backend.conversation_id}`,
+              conversationId: backend.conversation_id,
+              title: "New chat",
+              updatedAt: backend.updated_at || new Date().toISOString(),
+              sessionId: backend.session_id || "",
+              messages: [],
+            };
+          });
+          const localOnly = current.filter((item) => !item.conversationId);
+          return [...localOnly, ...merged];
+        });
+      })
+      .catch((error) => {
+        if (onComposerStatus) onComposerStatus(error.message);
+      })
+      .finally(() => {
+        pendingLoadRef.current = false;
+      });
+  }, [activeWorkspaceId, onComposerStatus]);
+
+  const updateConversation = useCallback((localId, updater) => {
+    setConversations((current) =>
+      current.map((conv) => (conv.localId === localId ? updater(conv) : conv))
+    );
+  }, []);
+
+  const updateLastAssistant = useCallback((conversation, updater) => {
+    const messages = [...conversation.messages];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "assistant") {
+        messages[i] = updater(messages[i]);
+        break;
+      }
+    }
+    return { ...conversation, messages };
+  }, []);
+
+  const submitQuestion = useCallback(
+    async (content, workspaceId, onSelectSource) => {
+      if (!content || !workspaceId || !activeConversationLocalId) {
+        return;
+      }
+
+      const timestamp = new Date().toISOString();
+      const userMessage = {
+        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        role: "user",
+        content,
+        timestamp,
+      };
+      const assistantMessage = {
+        id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+        timestamp,
+        sources: [],
+        insights: [],
+        themes: [],
+      };
+
+      setIsThinking(true);
+      setLoadingStage("Retrieving sources...");
+
+      updateConversation(activeConversationLocalId, (conv) => {
+        const nextMessages = [...conv.messages, userMessage, assistantMessage];
+        return {
+          ...conv,
+          messages: nextMessages,
+          title: conv.title && conv.title !== "New chat" ? conv.title : deriveTitle(nextMessages),
+          updatedAt: timestamp,
+        };
+      });
+
+      const activeConversationRecord =
+        conversations.find((conv) => conv.localId === activeConversationLocalId) || null;
+      const conversationId = activeConversationRecord?.conversationId || "";
+
+      try {
+        await streamKnowledgeQuery(
+          workspaceId,
+          content,
+          conversationId,
+          {
+            onMeta: (payload) => {
+              const sessionStorageKey = `session_id:${workspaceId}`;
+              if (payload.session_id) {
+                window.sessionStorage.setItem(sessionStorageKey, payload.session_id);
+              }
+
+              updateConversation(activeConversationLocalId, (conv) => {
+                const updated = updateLastAssistant(conv, (assistant) => ({
+                  ...assistant,
+                  sources: payload.sources || assistant.sources,
+                  insights: payload.insights || assistant.insights,
+                  themes: payload.themes || assistant.themes,
+                  rewrittenQuery: payload.rewritten_query || assistant.rewrittenQuery,
+                }));
+                return {
+                  ...updated,
+                  conversationId: payload.conversation_id || conv.conversationId,
+                  sessionId: payload.session_id || conv.sessionId,
+                };
+              });
+            },
+            onChunk: ({ delta }) => {
+              if (!delta) return;
+              setLoadingStage("Generating answer...");
+              updateConversation(activeConversationLocalId, (conv) =>
+                updateLastAssistant(conv, (assistant) => ({
+                  ...assistant,
+                  content: `${assistant.content || ""}${delta}`,
+                  isStreaming: true,
+                }))
+              );
+            },
+            onDone: (payload) => {
+              setIsThinking(false);
+              setLoadingStage("");
+              if (payload.sources && payload.sources.length > 0 && onSelectSource) {
+                onSelectSource(payload.sources[0]);
+              }
+              updateConversation(activeConversationLocalId, (conv) => ({
+                ...updateLastAssistant(conv, (assistant) => ({
+                  ...assistant,
+                  content: payload.answer || assistant.content,
+                  isStreaming: false,
+                  sources: payload.sources || assistant.sources,
+                  confidence: payload.confidence,
+                  suggestions: payload.suggestions || [],
+                  debug: payload.debug,
+                  insights: payload.insights || [],
+                  themes: payload.themes || [],
+                  rewrittenQuery: payload.rewritten_query || assistant.rewrittenQuery,
+                })),
+                conversationId: payload.conversation_id || conv.conversationId,
+                sessionId: payload.session_id || conv.sessionId,
+                updatedAt: new Date().toISOString(),
+              }));
+            },
+          }
+        );
+      } catch (error) {
+        setIsThinking(false);
+        setLoadingStage("");
+        if (onComposerStatus) onComposerStatus(error.message);
+        updateConversation(activeConversationLocalId, (conv) =>
+          updateLastAssistant(conv, (assistant) => ({
+            ...assistant,
+            content: assistant.content || "Something went wrong. Please try again.",
+            isStreaming: false,
+          }))
+        );
+      }
+    },
+    [
+      activeConversationLocalId,
+      conversations,
+      onComposerStatus,
+      updateConversation,
+      updateLastAssistant,
+    ]
+  );
+
+  const createNewChat = useCallback(() => {
+    if (!activeWorkspaceId) return null;
+    const conversation = createLocalConversation();
+    setConversations((current) => [conversation, ...current]);
+    setActiveConversationLocalId(conversation.localId);
+    return conversation;
+  }, [activeWorkspaceId]);
+
+  const hydrateConversation = useCallback(
+    async (localId) => {
+      const target = conversations.find((conv) => conv.localId === localId);
+      if (!target || !target.conversationId || target.messages.length) return;
+      try {
+        const data = await fetchConversationMessages(activeWorkspaceId, target.conversationId);
+        const messages = data.messages || [];
+        updateConversation(localId, (conv) => ({
+          ...conv,
+          messages,
+          title: deriveTitle(messages),
+        }));
+      } catch (error) {
+        if (onComposerStatus) onComposerStatus(error.message);
+      }
+    },
+    [activeWorkspaceId, conversations, onComposerStatus, updateConversation]
+  );
+
+  const clearWorkspaceConversations = useCallback((workspaceId) => {
+    window.localStorage.removeItem(`${STORAGE_PREFIX}${workspaceId}`);
+  }, []);
+
+  return {
+    conversations,
+    activeConversation,
+    activeConversationLocalId,
+    setActiveConversationLocalId,
+    updateConversation,
+    createNewChat,
+    hydrateConversation,
+    clearWorkspaceConversations,
+    submitQuestion,
+    isThinking,
+    loadingStage,
+  };
 }

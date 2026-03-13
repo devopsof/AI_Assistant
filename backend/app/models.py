@@ -65,8 +65,8 @@ class AuthRequest(BaseModel):
 
 
 class AuthResponse(BaseModel):
-    token: str
-    user_id: str
+    access_token: str
+    token_type: str
 
 
 class QueryRequest(BaseModel):
@@ -160,6 +160,7 @@ class HealthResponse(BaseModel):
     vector_db: str
     model_loaded: bool
     storage: str
+    uptime_seconds: float | None = None
 
 
 class SearchResult(BaseModel):

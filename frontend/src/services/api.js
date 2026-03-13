@@ -62,6 +62,22 @@ export async function fetchWorkspaces() {
     return requestJson(`${API_BASE_URL}/workspaces`, undefined, "Failed to load workspaces.");
 }
 
+export async function fetchConversations(workspaceId) {
+    return requestJson(
+        `${API_BASE_URL}/workspaces/${workspaceId}/conversations`,
+        undefined,
+        "Failed to load conversations."
+    );
+}
+
+export async function fetchConversationMessages(workspaceId, conversationId) {
+    return requestJson(
+        `${API_BASE_URL}/workspaces/${workspaceId}/conversations/${conversationId}/messages`,
+        undefined,
+        "Failed to load messages."
+    );
+}
+
 export async function createWorkspace(workspaceName) {
     return requestJson(
         `${API_BASE_URL}/workspaces`, {
